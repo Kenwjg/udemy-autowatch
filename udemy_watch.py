@@ -52,6 +52,34 @@ def log_ev(title, dur, url="", course_name="", course_url=""):
         save_state(url)
 
 
+def log_skip(title, course_name="", course_url="", dur=300, url=""):
+    """记录被标记完成但跳过的章节，使用估算时长（默认 5 分钟）。
+    确保这些章节也被计入统计，避免总时长偏少。"""
+    entry = {
+        "ts": datetime.now().isoformat(),
+        "title": title,
+        "dur": dur,
+        "status": "done",
+        "skip": True,
+        "course_name": course_name,
+        "course_url": course_url,
+    }
+    with open(LOG, "a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    if url:
+        save_state(url)
+
+
+def _log_skip_with_info(log_info, url=""):
+    """根据 try_skip 提供的上下文记录一条 done 日志。
+    估算时长策略：优先用已传入的 dur，其次 5 分钟默认值。"""
+    title = log_info.get("title", "N/A")
+    cname = log_info.get("course_name", "")
+    curl = log_info.get("course_url", "")
+    dur = log_info.get("dur", 300)
+    log_skip(title, cname, curl, dur, url)
+
+
 def log_action(action, url="", detail="", success=True):
     """记录标记完成/跳过/导航等操作到日志文件。"""
     entry = {
@@ -327,39 +355,66 @@ async def login_wait(page):
         await asyncio.sleep(3)
 
 async def extract_course_info(page):
-    """从页面提取课程名和课程 URL"""
+    """从页面提取课程名和课程 URL。
+    多策略匹配，兼容 Udemy Business (HTA) 中文页面。"""
     course_name = ""
     course_url = ""
     try:
-        # 尝试从侧边栏或面包屑获取课程名
-        for sel in [
+        # 策略1: 侧边栏课程标题
+        name_selectors = [
             '[data-purpose="course-title"]',
-            '.udemy-breadcrumb a:last-child',
+            'a[data-purpose="course-title-url"]',
+            '.udemy-breadcrumb a',
             '.course-title',
-            'a[href*="/course/"] span',
-        ]:
-            el = await page.query_selector(sel)
-            if el:
-                course_name = (await el.inner_text()).strip()
-                if course_name:
-                    break
-        
+            'h1[data-purpose="course-header-title"]',
+            '.section--course-title',
+            'nav a[href*="/course/"]',
+        ]
+        for sel in name_selectors:
+            els = await page.query_selector_all(sel)
+            for el in els:
+                try:
+                    txt = (await el.inner_text()).strip()
+                    if txt and len(txt) > 3 and not txt.startswith("http"):
+                        # 过滤无关文本
+                        if txt.lower() not in ("udemy business", "udemy", "我的学习", "my learning", "back"):
+                            course_name = txt
+                            break
+                except:
+                    continue
+            if course_name:
+                break
+
+        # 策略2: 页面 title: "Lecture | Course Name | Udemy" 或 "章节名 | 课程名 | Udemy"
         if not course_name:
-            # 从页面标题提取: "Lecture | Course Name | Udemy"
             t = await page.title()
             parts = t.split("|")
             if len(parts) >= 2:
-                course_name = parts[1].strip()
-        
+                fn = parts[1].strip()
+                if fn and fn.lower() not in ("udemy", "udemy business", "lecture"):
+                    course_name = fn
+            elif len(parts) == 1 and "-" in t:
+                # "课程名 - Udemy" 格式
+                fn = t.split("-")[0].strip()
+                if len(fn) > 3:
+                    course_name = fn
+
         # 提取课程 URL
-        el = await page.query_selector('a[href*="/course/"][href*="/learn/"]')
-        if not el:
-            el = await page.query_selector('a[href*="/course/"]')
-        if el:
-            href = await el.get_attribute("href") or ""
-            m = re.match(r'(/course/\d+/)', href)
-            if m:
-                course_url = f"https://hta.udemy.com{m.group(1)}"
+        for sel in [
+            'a[data-purpose="course-title-url"]',
+            'a[href*="/course/"][href*="/learn/"]',
+            'nav a[href*="/course/"]',
+            '.breadcrumb a[href*="/course/"]',
+        ]:
+            if course_url:
+                break
+            els = await page.query_selector_all(sel)
+            for el in els:
+                href = (await el.get_attribute("href")) or ""
+                m = re.search(r'/course/(\d+)', href)
+                if m:
+                    course_url = f"https://hta.udemy.com/course/{m.group(1)}/"
+                    break
     except:
         pass
     return course_name, course_url
@@ -543,9 +598,12 @@ async def force_navigate_next(page, url_before):
     return False
 
 
-async def try_skip(page, last_url, label=''):
+async def try_skip(page, last_url, label='', log_info=None):
     """统一的跳过逻辑：标记完成 → 点 Next → 验证跳转。
-    返回 True 表示 URL 已变化（成功跳转），False 表示卡住。"""
+    返回 True 表示 URL 已变化（成功跳转），False 表示卡住。
+    
+    如果提供 log_info dict，成功时会自动记录到 log（避免统计遗漏）。
+    log_info 应包含: title, course_name, course_url (均为可选)"""
     url_before = page.url
     print(f'  ⏭ [{label}] 开始跳过流程 (URL: {url_before[-50:]})')
     log_action('try_skip_start', url_before, f'label={label}', True)
@@ -564,6 +622,8 @@ async def try_skip(page, last_url, label=''):
     if url_after != url_before:
         print(f'  ✓ [{label}] 跳转成功 (click_next)')
         log_action('try_skip_success', url_before, f'method=click_next, url_after={url_after}', True)
+        if log_info:
+            _log_skip_with_info(log_info, page.url)
         return True
 
     # Step 3: 键盘兜底
@@ -576,6 +636,8 @@ async def try_skip(page, last_url, label=''):
     if page.url != url_before:
         print(f'  ✓ [{label}] 跳转成功 (keyboard n)')
         log_action('try_skip_success', url_before, 'method=keyboard_n', True)
+        if log_info:
+            _log_skip_with_info(log_info, page.url)
         return True
 
     # Step 4: 侧边栏点击下一个 lecture
@@ -642,6 +704,8 @@ async def try_skip(page, last_url, label=''):
             if page.url != url_before:
                 print(f'  ✓ [{label}] 跳转成功 ({clicked.get("method", "sidebar")})')
                 log_action('try_skip_success', url_before, f'method={clicked.get("method")}', True)
+                if log_info:
+                    _log_skip_with_info(log_info, page.url)
                 return True
     except:
         pass
@@ -650,6 +714,8 @@ async def try_skip(page, last_url, label=''):
     print(f'  → [{label}] 所有 click 方式失败，尝试强制导航...')
     if await force_navigate_next(page, url_before):
         log_action('try_skip_success', url_before, 'method=force_navigate', True)
+        if log_info:
+            _log_skip_with_info(log_info, page.url)
         return True
 
     # 全部失败 → dump
@@ -733,7 +799,8 @@ async def watch(page, target_s, rate):
                 print(f"  ⏭ 视频错误已重试 {MAX_ERROR_RETRIES} 次仍失败，标记完成并跳过")
                 log_action("video_error_give_up", page.url, f"max retries ({MAX_ERROR_RETRIES}) exceeded, skipping", False)
                 error_retry_count = 0
-                if await try_skip(page, last_url, "video-error"):
+                if await try_skip(page, last_url, "video-error",
+                                   {"title": title, "course_name": course_name, "course_url": course_url}):
                     no_vid = 0; last_ct = -1; stag_count = 0
                     play_fail = 0; refresh_count = 0
                     last_progress = time.time()
@@ -792,7 +859,8 @@ async def watch(page, target_s, rate):
                     no_vid += 1
                     if no_vid >= 2:
                         print(f"  ⏭ 无视频内容(duration={dur})，标记完成并跳过")
-                        if await try_skip(page, last_url, "no-content"):
+                        if await try_skip(page, last_url, "no-content",
+                                           {"title": title, "course_name": course_name, "course_url": course_url}):
                             no_vid = 0; last_ct = -1; stag_count = 0
                             refresh_count = 0; play_fail = 0
                             last_progress = time.time()
@@ -815,7 +883,8 @@ async def watch(page, target_s, rate):
                     if play_fail >= 3:
                         print(f"  ⏭ play() {play_fail}次仍暂停，标记完成跳过")
                         play_fail = 0
-                        if await try_skip(page, last_url, "play-fail"):
+                        if await try_skip(page, last_url, "play-fail",
+                                           {"title": title, "course_name": course_name, "course_url": course_url}):
                             last_ct = -1; stag_count = 0
                             last_progress = time.time()
                         rd(1, 2)
@@ -845,7 +914,8 @@ async def watch(page, target_s, rate):
                         if stag_count >= 4:
                             print(f"  ⏭ currentTime 停滞 {stag_count}轮(ct={ct:.1f})，标记完成跳过")
                             stag_count = 0
-                            if await try_skip(page, last_url, "stag"):
+                            if await try_skip(page, last_url, "stag",
+                                               {"title": title, "course_name": course_name, "course_url": course_url}):
                                 last_ct = -1; play_fail = 0
                                 last_progress = time.time()
                             rd(1, 2)
@@ -856,7 +926,8 @@ async def watch(page, target_s, rate):
                 vid_read_fail += 1
                 if vid_read_fail >= 3:
                     print(f"  ⏭ 视频不可访问({e})，标记完成并跳过")
-                    if await try_skip(page, last_url, "except"):
+                    if await try_skip(page, last_url, "except",
+                                       {"title": title, "course_name": course_name, "course_url": course_url}):
                         no_vid = 0; vid_read_fail = 0; last_ct = -1
                         stag_count = 0; refresh_count = 0; play_fail = 0
                         last_progress = time.time()
@@ -869,7 +940,8 @@ async def watch(page, target_s, rate):
             no_vid += 1
             if no_vid >= 1:
                 print(f"  ⏭ 无视频元素，标记完成并跳过")
-                if await try_skip(page, last_url, "no-video"):
+                if await try_skip(page, last_url, "no-video",
+                                   {"title": title, "course_name": course_name, "course_url": course_url}):
                     no_vid = 0; last_ct = -1; stag_count = 0
                     refresh_count = 0; play_fail = 0
                     last_progress = time.time()
@@ -882,7 +954,8 @@ async def watch(page, target_s, rate):
         stuck_dur = time.time() - last_progress
         if stuck_dur > 30:
             print(f"  ⏭ 卡住 {stuck_dur:.0f}s，标记完成强制跳过")
-            if await try_skip(page, last_url, "stuck-30s"):
+            if await try_skip(page, last_url, "stuck-30s",
+                               {"title": title, "course_name": course_name, "course_url": course_url}):
                 no_vid = 0; last_ct = -1; stag_count = 0
                 play_fail = 0; refresh_count = 0
                 last_progress = time.time()
@@ -893,7 +966,8 @@ async def watch(page, target_s, rate):
             refresh_count += 1
             if refresh_count >= 2:
                 print(f"  ⏭ 已刷新 {refresh_count}次仍卡住，标记完成跳过")
-                if await try_skip(page, last_url, "stuck-refresh"):
+                if await try_skip(page, last_url, "stuck-refresh",
+                                   {"title": title, "course_name": course_name, "course_url": course_url}):
                     no_vid = 0; last_ct = -1; stag_count = 0
                     play_fail = 0; refresh_count = 0
                     last_progress = time.time()

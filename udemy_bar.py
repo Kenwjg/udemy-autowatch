@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-Udemy 刷课 - macOS 菜单栏
+Udemy 刷课 - macOS 菜单栏（增强版）
+支持进度条、课程进度/剩余/总时长统计
 """
-import json, os, subprocess, sys
+import json, os, subprocess, sys, re
 from datetime import datetime
+from collections import defaultdict
 import rumps
 from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def _find_icon(name):
-    """优先从脚本目录查找图标，其次 ~/udemy_icons/"""
     p = os.path.join(SCRIPT_DIR, name)
-    if os.path.exists(p):
-        return p
+    if os.path.exists(p): return p
     p2 = os.path.expanduser(f"~/udemy_icons/{name}")
-    if os.path.exists(p2):
-        return p2
+    if os.path.exists(p2): return p2
     return None
 
 ICON_PLAY = _find_icon("play.png")
@@ -28,6 +27,23 @@ LOG_FILE = os.path.expanduser("~/udemy_watch_log.jsonl")
 TARGET_FILE = os.path.expanduser("~/udemy_target_hours.json")
 COURSES_FILE = os.path.expanduser("~/udemy_courses.json")
 
+# ── 进度条配置 ──
+BAR_WIDTH = 10  # 进度条宽度（字符数）
+
+def _progress_bar(current, target):
+    """返回 Unicode 进度条字符串，如 '████████░░ 8.5h/30h (28%)'"""
+    pct = min(current / target, 1.0) if target > 0 else 0
+    filled = int(pct * BAR_WIDTH)
+    bar = "█" * filled + "░" * (BAR_WIDTH - filled)
+    return f"{bar} {current:.1f}h/{target}h ({pct*100:.0f}%)"
+
+def _fmt_dur(seconds):
+    """格式化秒数为可读字符串"""
+    if seconds < 60: return f"{int(seconds)}s"
+    if seconds < 3600: return f"{int(seconds/60)}m"
+    return f"{seconds/3600:.1f}h"
+
+# ── 数据加载 ──
 
 def load_logs():
     if not os.path.exists(LOG_FILE): return []
@@ -56,35 +72,39 @@ def load_courses():
             data = json.load(open(COURSES_FILE))
             if isinstance(data, dict) and "courses" in data:
                 return data
-            elif isinstance(data, dict):
-                return {"courses": [], "fetched_at": "", "count": 0}
         except: pass
     return {"courses": [], "fetched_at": "", "count": 0}
 
+
+# ── 统计 ──
 
 def monthly_hours(entries):
     now = datetime.now()
     ms = datetime(now.year, now.month, 1)
     me = datetime(now.year + 1, 1, 1) if now.month == 12 else datetime(now.year, now.month + 1, 1)
-    return sum(e["dur"] for e in entries if ms <= datetime.fromisoformat(e["ts"]) < me and e["status"] == "done") / 3600
+    return sum(e["dur"] for e in entries
+               if ms <= datetime.fromisoformat(e["ts"]) < me and e["status"] == "done") / 3600
 
 
 def total_hours(entries):
     return sum(e["dur"] for e in entries if e["status"] == "done") / 3600
 
 
-def course_stats(entries):
-    """按课程统计：{course_name: {lecture_count, total_dur, course_url, last_ts}}"""
+def course_log_stats(entries):
+    """从日志中按课程名聚合统计。
+    返回 {course_name: {count, skipped_count, total_dur, url, last_ts}}"""
     stats = {}
     for e in entries:
         if e["status"] != "done": continue
-        cn = e.get("course_name", "")
-        cu = e.get("course_url", "")
+        cn = e.get("course_name", "").strip()
+        cu = e.get("course_url", "").strip()
         if not cn:
             cn = "(未分类)"
         if cn not in stats:
-            stats[cn] = {"count": 0, "total_dur": 0, "url": cu, "last_ts": e["ts"]}
+            stats[cn] = {"count": 0, "skipped": 0, "total_dur": 0, "url": cu, "last_ts": e["ts"]}
         stats[cn]["count"] += 1
+        if e.get("skip"):
+            stats[cn]["skipped"] += 1
         stats[cn]["total_dur"] += e["dur"]
         if e["ts"] > stats[cn]["last_ts"]:
             stats[cn]["last_ts"] = e["ts"]
@@ -102,6 +122,127 @@ def monthly_breakdown(entries):
     return dict(sorted(bc.items()))
 
 
+def _match_course_by_name(fetch_name, log_cnames):
+    """模糊匹配课程名：检查是否包含关键部分"""
+    fn = fetch_name.strip().lower()
+    # 去除特殊字符后的纯文本匹配
+    fn_clean = re.sub(r'[\s\-\.\(\),;:!！：；（）]', '', fn)
+    for log_name in log_cnames:
+        ln = log_name.strip().lower()
+        ln_clean = re.sub(r'[\s\-\.\(\),;:!！：；（）]', '', ln)
+        # 精确匹配
+        if fn == ln: return log_name
+        if fn_clean == ln_clean: return log_name
+        # 包含匹配（一方包含另一方）
+        if len(fn_clean) > 6 and fn_clean in ln_clean: return log_name
+        if len(ln_clean) > 6 and ln_clean in fn_clean: return log_name
+    return None
+
+
+def enriched_courses(entries):
+    """将 fetch 课程数据与刷课日志交叉关联，返回增强后的课程列表。
+    每门课程包含: name, url, progress%, watched_lectures, total_lectures,
+    watched_time, total_hours, remaining_lectures, remaining_time
+    """
+    courses_data = load_courses()
+    raw_courses = courses_data.get("courses", [])
+    log_stats = course_log_stats(entries)
+    log_cnames = list(log_stats.keys())
+
+    enriched = []
+    for c in raw_courses:
+        cname = c.get("name", "(未知)")
+        curl = c.get("url", "")
+        progress = c.get("progress", "")
+        total_lec = c.get("lectures_total", "")
+        total_hrs = c.get("total_hours", "")
+
+        # 匹配日志中的课程统计
+        matched_log_name = _match_course_by_name(cname, log_cnames)
+        log_s = log_stats.get(matched_log_name) if matched_log_name else None
+
+        watched_lec = 0
+        skipped_lec = 0
+        watched_dur = 0
+        if log_s:
+            watched_lec = log_s["count"]
+            skipped_lec = log_s.get("skipped", 0)
+            watched_dur = log_s["total_dur"]
+
+        # 计算进度（优先用抓取到的 progress%，其次根据节数估算）
+        progress_pct = 0
+        if progress:
+            try:
+                progress_pct = int(progress)
+            except:
+                pass
+        elif total_lec:
+            try:
+                progress_pct = int(watched_lec / int(total_lec) * 100)
+            except:
+                pass
+
+        # 剩余
+        remaining_lec = ""
+        if total_lec:
+            try:
+                remaining_lec = str(int(total_lec) - watched_lec)
+            except:
+                pass
+
+        remaining_time = ""
+        if total_hrs:
+            try:
+                remaining_time = max(float(total_hrs) * 3600 - watched_dur, 0)
+            except:
+                pass
+
+        enriched.append({
+            "name": cname,
+            "url": curl,
+            "progress_pct": progress_pct,
+            "progress_raw": progress,
+            "watched_lec": watched_lec,
+            "skipped_lec": skipped_lec,
+            "total_lec": total_lec,
+            "watched_dur": watched_dur,
+            "total_hrs": total_hrs,
+            "remaining_lec": remaining_lec,
+            "remaining_time": remaining_time,
+        })
+
+    # 处理日志中存在但 fetch 没有的课程（比如名字不匹配的）
+    matched_fetch_names = set()
+    for ec in enriched:
+        matched_log_name = _match_course_by_name(ec["name"], log_cnames)
+        if matched_log_name:
+            matched_fetch_names.add(matched_log_name)
+
+    for log_name, log_s in log_stats.items():
+        if log_name in matched_fetch_names or log_name == "(未分类)":
+            continue
+        enriched.append({
+            "name": log_name,
+            "url": log_s.get("url", ""),
+            "progress_pct": 0,
+            "progress_raw": "",
+            "watched_lec": log_s["count"],
+            "skipped_lec": log_s.get("skipped", 0),
+            "total_lec": "",
+            "watched_dur": log_s["total_dur"],
+            "total_hrs": "",
+            "remaining_lec": "",
+            "remaining_time": "",
+        })
+
+    # 排序：有进度的在前面，按进度排序；没进度的在后面
+    enriched.sort(key=lambda x: (-x["progress_pct"], -x["watched_dur"]))
+
+    return enriched
+
+
+# ── 主 App ──
+
 class UdemyBarApp(rumps.App):
     def __init__(self):
         super(UdemyBarApp, self).__init__(
@@ -117,9 +258,6 @@ class UdemyBarApp(rumps.App):
     def _build_menu(self):
         self.menu.clear()
         entries = load_logs()
-        stats = course_stats(entries)
-        courses_data = load_courses()
-        courses = courses_data.get("courses", [])
         tg = load_target()
         mn = monthly_hours(entries)
         tt = total_hours(entries)
@@ -141,63 +279,107 @@ class UdemyBarApp(rumps.App):
 
         self.menu.add(rumps.separator)
 
-        # ── 课程列表（可选择的） ──
+        # ── 进度条 ──
+        bar_text = _progress_bar(mn, tg)
+        self.menu.add(rumps.MenuItem(f"📊 {bar_text}", callback=None))
+        if running:
+            self.menu.add(rumps.MenuItem("  (刷课中，每10秒刷新)", callback=None))
+
+        self.menu.add(rumps.separator)
+
+        # ── 课程列表（增强：进度/剩余/时长） ──
+        enriched = enriched_courses(entries)
         courses_menu = rumps.MenuItem("📚 课程列表")
         courses_menu.add(rumps.MenuItem("🔄 刷新课程列表", callback=self.refresh_courses))
+
+        fetched_at = load_courses().get("fetched_at", "")
+        if fetched_at:
+            try:
+                dt = datetime.fromisoformat(fetched_at)
+                courses_menu.add(rumps.MenuItem(f"  上次刷新: {dt.strftime('%m-%d %H:%M')}", callback=None))
+            except:
+                pass
+
         courses_menu.add(rumps.separator)
-        if courses:
-            for i, c in enumerate(courses):
-                prog = f" [{c.get('progress', '')}%]" if c.get('progress') else ""
-                name = c.get("name", "(未知名称)")
-                label = f"{i+1}. {name[:35]}{prog}"
-                item = rumps.MenuItem(label, callback=self.select_course(c))
+
+        if enriched:
+            for i, c in enumerate(enriched):
+                name = c["name"]
+                prog = c["progress_pct"]
+
+                # 进度标记
+                if prog >= 100:
+                    icon = "✅"
+                elif prog > 0:
+                    icon = "📖"
+                else:
+                    icon = "📁"
+
+                # 构建详情
+                parts = []
+                if prog > 0:
+                    parts.append(f"{prog}%")
+                if c["watched_lec"] > 0:
+                    skipped = f" (含{c['skipped_lec']}跳)" if c["skipped_lec"] else ""
+                    parts.append(f"刷{c['watched_lec']}节{skipped}")
+                dur_str = _fmt_dur(c["watched_dur"])
+                if c["watched_dur"] > 0:
+                    parts.append(dur_str)
+
+                # 总时长
+                if c["total_hrs"]:
+                    parts.append(f"共{c['total_hrs']}h")
+
+                # 剩余
+                remaining_parts = []
+                if c["remaining_lec"]:
+                    remaining_parts.append(f"剩{c['remaining_lec']}节")
+                if c["remaining_time"]:
+                    remaining_parts.append(_fmt_dur(c["remaining_time"]))
+                if remaining_parts:
+                    parts.append(f"({', '.join(remaining_parts)})")
+
+                label = f"{i+1}. {icon} {name[:32]}"
+                detail = " | ".join(parts) if parts else "未开始"
+                detail_label = f"   {detail}"
+
+                item = rumps.MenuItem(label)
+                item.add(rumps.MenuItem(detail_label, callback=None))
+                if c["url"]:
+                    item.add(rumps.MenuItem("▶ 继续刷这门课", callback=self.select_course(c)))
                 courses_menu.add(item)
         else:
-            courses_menu.add(rumps.MenuItem("  (暂无课程，点击刷新)", callback=None))
+            courses_menu.add(rumps.MenuItem("  (暂无课程，点击刷新获取)", callback=None))
         self.menu.add(courses_menu)
 
         self.menu.add(rumps.separator)
 
-        # ── 已刷课程（含进度） ──
-        self.menu.add(rumps.MenuItem("已刷课程", callback=None))
-        if stats:
-            for cname in sorted(stats.keys()):
-                s = stats[cname]
-                mins = int(s["total_dur"] / 60)
-                curl = s.get("url", "")
-                label = f"  {cname[:25]} ({s['count']}节, {mins}m)"
-                item = rumps.MenuItem(label)
-                item.add(rumps.MenuItem(f"已刷 {s['count']} 节 | 共 {mins}m", callback=None))
-                if curl:
-                    item.add(rumps.separator)
-                    item.add(rumps.MenuItem("▶ 继续刷这门课", callback=self.resume_course(curl)))
-                self.menu.add(item)
-        else:
-            self.menu.add(rumps.MenuItem("  (暂无记录)", callback=None))
-
-        self.menu.add(rumps.separator)
-        self.menu.add(rumps.MenuItem(f"本月 {mn:.1f}h / {tg}h", callback=None))
-
+        # ── 总计与月度明细 ──
         total_item = rumps.MenuItem(f"总计 {tt:.1f}h")
         breakdown = monthly_breakdown(entries)
         if breakdown:
             for month, hours in breakdown.items():
-                total_item.add(rumps.MenuItem(f"{month}: {hours:.1f}h", callback=None))
+                pct_str = ""
+                if month == datetime.now().strftime("%Y-%m") and tg > 0:
+                    pct_str = f" ({hours/tg*100:.0f}%)"
+                total_item.add(rumps.MenuItem(f"  {month}: {hours:.1f}h{pct_str}", callback=None))
         else:
-            total_item.add(rumps.MenuItem("(暂无数据)", callback=None))
+            total_item.add(rumps.MenuItem("  (暂无数据)", callback=None))
         self.menu.add(total_item)
 
         self.menu.add(rumps.separator)
+
+        # ── 目标设置 ──
         target_menu = rumps.MenuItem("设置本月目标")
         for h in [10, 20, 30, 40, 50, 60]:
-            target_menu.add(rumps.MenuItem(f"{h}h", callback=self.set_target))
+            mark = " ✓" if h == tg else ""
+            target_menu.add(rumps.MenuItem(f"  {h}h{mark}", callback=self.set_target))
         self.menu.add(target_menu)
 
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem("退出", callback=self.quit_app))
 
     def refresh_courses(self, sender):
-        """运行 fetch_courses.py 刷新课程列表"""
         rumps.notification("Udemy", "正在刷新课程列表...", "请等待浏览器窗口加载")
         try:
             subprocess.Popen(["/usr/bin/python3", FETCH_SCRIPT])
@@ -205,7 +387,6 @@ class UdemyBarApp(rumps.App):
             rumps.alert("刷新失败", str(e))
 
     def select_course(self, course):
-        """返回一个 callback，点击后开始刷选中的课程"""
         def cb(sender):
             url = course.get("url", "")
             if not url:
@@ -215,7 +396,6 @@ class UdemyBarApp(rumps.App):
         return cb
 
     def resume_course(self, course_url):
-        """返回一个 callback，点击后启动续播"""
         def cb(sender):
             self._start_watch_with_url(course_url)
         return cb
@@ -245,7 +425,7 @@ class UdemyBarApp(rumps.App):
 
     def set_target(self, sender):
         try:
-            h = int(sender.title.replace("h", ""))
+            h = int(sender.title.strip().replace("h", "").replace("✓", "").strip())
             save_target(h)
             self._build_menu()
         except ValueError:
