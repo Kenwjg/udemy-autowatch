@@ -273,15 +273,34 @@ class UdemyBarApp(rumps.App):
         rumps.Timer(self._startup_notify, 1).start()
 
     def _startup_notify(self, _):
-        """延迟1秒发通知，确保 app 已完全启动"""
+        """延迟1秒弹窗，确保 app 已完全启动"""
         if hasattr(self, '_notified'):
             return
         self._notified = True
         try:
             rumps.notification("Udemy 刷课", "已启动", "菜单栏显示 '▶ Udemy'", sound=False)
-            _debug("启动通知已发送")
+            _debug("通知已发送")
+            # 弹窗让用户看到 app 已启动
+            rumps.alert(
+                title="Udemy 刷课已启动",
+                message="App 正在运行！\n\n"
+                        "👉 点击屏幕顶部菜单栏的 '▶ Udemy' 文字\n"
+                        "   可以开始刷课、查看进度、选择课程\n\n"
+                        "👉 App 图标也在 Dock 中显示\n\n"
+                        "如果菜单栏看不到，可能被其他图标挤到折叠区了，\n"
+                        "按住 Cmd 拖动可以调整位置。",
+                ok="知道了",
+                cancel=None
+            )
+            _debug("启动弹窗已显示")
         except Exception as e:
-            _debug(f"通知失败: {e}")
+            _debug(f"启动通知失败: {e}")
+            _debug(traceback.format_exc())
+        # 停止这个一次性 timer
+        try:
+            self._startup_notify_timer.stop()
+        except:
+            pass
 
     def _build_menu(self):
         self.menu.clear()
@@ -483,7 +502,8 @@ def main():
     _debug(f"rumps imported OK")
     _debug("创建 NSApplication...")
     app = NSApplication.sharedApplication()
-    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+    # 不再设置 accessory 模式 — 让 app 在 Dock 显示图标
+    app.activateIgnoringOtherApps_(True)
     _debug("创建 UdemyBarApp...")
     udemy_app = UdemyBarApp()
     _debug("调用 .run()...")

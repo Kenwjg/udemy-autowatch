@@ -41,8 +41,6 @@ cat > "$APP/Contents/Info.plist" << 'PLIST'
     <string>2</string>
     <key>LSMinimumSystemVersion</key>
     <string>10.13</string>
-    <key>LSUIElement</key>
-    <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>
