@@ -246,14 +246,15 @@ def enriched_courses(entries):
 class UdemyBarApp(rumps.App):
     def __init__(self):
         super(UdemyBarApp, self).__init__(
-            "Udemy",
-            title="Udemy",
-            icon=ICON_PLAY,
-            template=False,
+            "UdemyBar",
+            title="▶ Udemy",
             quit_button=None,
         )
         self._watch_proc = None
         self._build_menu()
+        # 启动通知，让用户知道 app 已运行
+        rumps.notification("Udemy 刷课", "已启动", "点击菜单栏 '▶ Udemy' 查看",
+            sound=False, action_button="好的")
 
     def _build_menu(self):
         self.menu.clear()
@@ -265,10 +266,8 @@ class UdemyBarApp(rumps.App):
 
         if running:
             self.title = "⏹ Udemy"
-            self.icon = ICON_STOP
         else:
             self.title = "▶ Udemy"
-            self.icon = ICON_PLAY
 
         # ── 开始/停止刷课 ──
         if running:
