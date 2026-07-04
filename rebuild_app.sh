@@ -4,13 +4,16 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP="$SCRIPT_DIR/UdemyBar.app"
+APP="$HOME/Applications/UdemyBar.app"
 RES="$APP/Contents/Resources"
 MACOS="$APP/Contents/MacOS"
 
 echo ">>> 停止旧进程..."
 pkill -f "udemy_bar.py" 2>/dev/null || true
 sleep 1
+
+echo ">>> 清理旧 .app..."
+rm -rf "$APP"
 
 echo ">>> 创建 .app 结构..."
 mkdir -p "$RES" "$MACOS"
@@ -27,7 +30,7 @@ cat > "$APP/Contents/Info.plist" << 'PLIST'
     <key>CFBundleExecutable</key>
     <string>UdemyBar</string>
     <key>CFBundleIdentifier</key>
-    <string>com.example.udemybar</string>
+    <string>com.kengong.udemybar</string>
     <key>CFBundleName</key>
     <string>UdemyBar</string>
     <key>CFBundlePackageType</key>
@@ -35,50 +38,80 @@ cat > "$APP/Contents/Info.plist" << 'PLIST'
     <key>CFBundleShortVersionString</key>
     <string>1.0</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>2</string>
     <key>LSMinimumSystemVersion</key>
     <string>10.13</string>
     <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
     <true/>
 </dict>
 </plist>
 PLIST
 
-# ---- Launcher ----
-cat > "$MACOS/UdemyBar" << 'LAUNCHER'
-#!/bin/bash
-# UdemyBar — 从 .app bundle 内部加载脚本
-APP_RESOURCES="$(cd "$(dirname "$0")/../Resources" 2>/dev/null && pwd)"
-MAIN_SCRIPT="$APP_RESOURCES/udemy_bar.py"
-if [ ! -f "$MAIN_SCRIPT" ]; then
-    for candidate in "$HOME/Downloads/codex" "$HOME/codex"; do
-        if [ -f "$candidate/udemy_bar.py" ]; then
-            APP_RESOURCES="$candidate"
-            MAIN_SCRIPT="$APP_RESOURCES/udemy_bar.py"
-            break
-        fi
-    done
-fi
-cd "$APP_RESOURCES" 2>/dev/null
-exec /usr/bin/python3 "$MAIN_SCRIPT" 2>> /tmp/udemybar_debug.log
-LAUNCHER
+# ---- 可执行文件：直接用 Python 脚本（带 shebang）----
+echo ">>> 创建可执行文件..."
+cat > "$MACOS/UdemyBar" << 'PYEOF'
+#!/usr/bin/python3
+import sys, os, traceback
+# 设置脚本路径
+_res = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Resources")
+_res = os.path.normpath(_res)
+sys.path.insert(0, _res)
+os.chdir(_res)
+# 日志函数
+def _log(msg):
+    try:
+        with open("/tmp/udemybar_debug.log", "a") as f:
+            f.write(str(msg) + "\n")
+    except: pass
+_log("Launcher started")
+_log(f"Python: {sys.executable}")
+_log(f"Resources: {_res}")
+_log(f"sys.path: {sys.path[:3]}")
+try:
+    from udemy_bar import main
+    _log("udemy_bar imported OK")
+    main()
+except Exception as e:
+    _log(f"FATAL: {e}")
+    _log(traceback.format_exc())
+PYEOF
 chmod +x "$MACOS/UdemyBar"
 
 # ---- 复制源码和资源 ----
 echo ">>> 复制源码到 .app..."
-cp "$SCRIPT_DIR/udemy_bar.py"   "$RES/"
-cp "$SCRIPT_DIR/udemy_watch.py" "$RES/"
-cp "$SCRIPT_DIR/play.png"       "$RES/" 2>/dev/null || echo "  ⚠ play.png 缺失"
-cp "$SCRIPT_DIR/stop.png"       "$RES/" 2>/dev/null || echo "  ⚠ stop.png 缺失"
+cp "$SCRIPT_DIR/udemy_bar.py"     "$RES/"
+cp "$SCRIPT_DIR/udemy_watch.py"   "$RES/"
+cp "$SCRIPT_DIR/fetch_courses.py" "$RES/"
+cp "$SCRIPT_DIR/play.png"         "$RES/" 2>/dev/null || true
+cp "$SCRIPT_DIR/stop.png"         "$RES/" 2>/dev/null || true
 chmod +x "$RES/udemy_bar.py" "$RES/udemy_watch.py"
+
+# ---- 清除隔离标记 ----
+echo ">>> 清除隔离标记..."
+xattr -cr "$APP" 2>/dev/null || true
 
 # ---- Ad-hoc 签名 ----
 echo ">>> 代码签名..."
-codesign --force --deep --sign - "$APP"
+codesign --force --deep --sign - "$APP" 2>/dev/null || true
+
+# ---- 刷新 Launch Services ----
+echo ">>> 刷新 Launch Services..."
+/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister -f "$APP" 2>/dev/null || true
 
 # ---- 启动 ----
 echo ">>> 启动应用..."
 open "$APP"
+sleep 3
 
-echo ""
-echo "✅ 完成！菜单栏应出现 Udemy 图标。"
+# ---- 验证 ----
+if pgrep -f "UdemyBar" > /dev/null 2>&1; then
+    echo ""
+    echo "✅ App 已启动！进程运行中。"
+    echo "📋 Debug 日志: /tmp/udemybar_debug.log"
+    echo "📋 菜单栏应显示 '▶ Udemy' 文字"
+else
+    echo ""
+    echo "⚠️  App 可能未成功启动，检查日志: /tmp/udemybar_debug.log"
+fi

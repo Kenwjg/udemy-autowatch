@@ -3,13 +3,22 @@
 Udemy 刷课 - macOS 菜单栏（增强版）
 支持进度条、课程进度/剩余/总时长统计
 """
-import json, os, subprocess, sys, re
+import json, os, subprocess, sys, re, traceback
 from datetime import datetime
 from collections import defaultdict
 import rumps
 from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEBUG_LOG = "/tmp/udemybar_debug.log"
+
+def _debug(msg):
+    """写入调试日志"""
+    try:
+        with open(DEBUG_LOG, "a") as f:
+            f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+    except:
+        pass
 
 def _find_icon(name):
     p = os.path.join(SCRIPT_DIR, name)
@@ -245,23 +254,46 @@ def enriched_courses(entries):
 
 class UdemyBarApp(rumps.App):
     def __init__(self):
+        _debug("App __init__ 开始")
         super(UdemyBarApp, self).__init__(
             "UdemyBar",
             title="▶ Udemy",
             quit_button=None,
         )
+        _debug("super().__init__ 完成")
         self._watch_proc = None
-        self._build_menu()
-        # 启动通知，让用户知道 app 已运行
-        rumps.notification("Udemy 刷课", "已启动", "点击菜单栏 '▶ Udemy' 查看",
-            sound=False, action_button="好的")
+        # 防崩溃：_build_menu 失败不影响状态栏图标
+        try:
+            self._build_menu()
+            _debug("_build_menu 完成")
+        except Exception as e:
+            _debug(f"_build_menu 失败: {e}")
+            self.menu = ["▶ 开始刷课", None, "退出"]
+        # 启动通知放到 timer 里，不在 __init__ 直接调
+        rumps.Timer(self._startup_notify, 1).start()
+
+    def _startup_notify(self, _):
+        """延迟1秒发通知，确保 app 已完全启动"""
+        if hasattr(self, '_notified'):
+            return
+        self._notified = True
+        try:
+            rumps.notification("Udemy 刷课", "已启动", "菜单栏显示 '▶ Udemy'", sound=False)
+            _debug("启动通知已发送")
+        except Exception as e:
+            _debug(f"通知失败: {e}")
 
     def _build_menu(self):
         self.menu.clear()
-        entries = load_logs()
-        tg = load_target()
-        mn = monthly_hours(entries)
-        tt = total_hours(entries)
+        try:
+            entries = load_logs()
+            tg = load_target()
+            mn = monthly_hours(entries)
+            tt = total_hours(entries)
+        except Exception as e:
+            _debug(f"数据加载失败: {e}")
+            entries, tg, mn, tt = [], 30, 0, 0
+
         running = self._watch_proc is not None and self._watch_proc.poll() is None
 
         if running:
@@ -440,7 +472,23 @@ class UdemyBarApp(rumps.App):
         self._build_menu()
 
 
-if __name__ == "__main__":
+def main():
+    """主入口函数，可被 .app launcher 或直接运行调用"""
+    global DEBUG_LOG
+    # 清空旧日志
+    with open(DEBUG_LOG, "w") as f:
+        f.write(f"[{datetime.now().isoformat()}] === UdemyBar 启动 ===\n")
+    _debug(f"Python: {sys.executable}")
+    _debug(f"Script dir: {SCRIPT_DIR}")
+    _debug(f"rumps imported OK")
+    _debug("创建 NSApplication...")
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
-    UdemyBarApp().run()
+    _debug("创建 UdemyBarApp...")
+    udemy_app = UdemyBarApp()
+    _debug("调用 .run()...")
+    udemy_app.run()
+
+
+if __name__ == "__main__":
+    main()
