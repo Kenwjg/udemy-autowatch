@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Local state & data (contains user-specific info)
+udemy_watch_state.json
+udemy_watch_log.jsonl
+udemy_courses.json
+udemy_target_hours.json
+
+# Debug dumps
+udemy_debug.png
+udemy_debug.html
+udemy_diagnosis.png
+udemy_mylearning.png
+udemy_mylearning.html
+page_dump.html
+
+# macOS
+.DS_Store
+
+# App bundle (built from source, don't commit)
+UdemyBar.app/
+
+# IDE
+.vscode/
+.idea/
