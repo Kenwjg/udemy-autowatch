@@ -16,8 +16,8 @@ except ImportError:
     from playwright.async_api import async_playwright
 
 # ── 配置 ──
-COURSE_URL = "https://your-org.udemy.com/organization/home/courses/  # 替换为你的 Udemy 课程 URL"
-PROFILE = os.path.expanduser("~/Library/Application Support/Udemy-AutoWatch-Chrome")
+COURSE_URL = "https://hta.udemy.com/organization/home/courses/  # 替换为你的 Udemy 课程 URL"
+PROFILE = os.path.expanduser("~/Library/Application Support/Codex-Udemy-Chrome")
 LOG = os.path.expanduser("~/udemy_watch_log.jsonl")
 STATE_FILE = os.path.expanduser("~/udemy_watch_state.json")
 COURSES_FILE = os.path.expanduser("~/udemy_courses.json")  # 课程元信息
@@ -319,7 +319,7 @@ async def login_wait(page):
     while True:
         u = page.url.lower()
         if not any(k in u for k in ["login", "auth", "sso", "signin", "?next="]):
-            if u.rstrip("/") not in ["https://your-org.udemy.com", "https://your-org.udemy.com/"]:
+            if u.rstrip("/") not in ["https://hta.udemy.com", "https://hta.udemy.com/"]:
                 ins = await page.query_selector_all('input[type="email"], input[type="password"]')
                 if len(ins) < 2:
                     print(" ✓")
@@ -359,7 +359,7 @@ async def extract_course_info(page):
             href = await el.get_attribute("href") or ""
             m = re.match(r'(/course/\d+/)', href)
             if m:
-                course_url = f"https://your-org.udemy.com{m.group(1)}"
+                course_url = f"https://hta.udemy.com{m.group(1)}"
     except:
         pass
     return course_name, course_url
@@ -383,7 +383,7 @@ async def one_time_nav(page):
                 h = await l.get_attribute("href") or ""
                 if h.startswith("/course/"):
                     print(f"  进入课程: {(await l.inner_text()).strip()[:50]}")
-                    await page.goto(f"https://your-org.udemy.com{h}", wait_until="domcontentloaded")
+                    await page.goto(f"https://hta.udemy.com{h}", wait_until="domcontentloaded")
                     rd(4, 8)
                     break
             continue
@@ -406,6 +406,42 @@ async def one_time_nav(page):
         
         rd(2, 4)
     return False
+
+
+async def detect_video_error(page):
+    """检测 Udemy 视频播放错误提示。
+    页面可能出现 "视频错误" 或 "Video Error" 及相关描述文本。
+    返回 True 表示检测到错误。"""
+    try:
+        result = await page.evaluate("""
+            () => {
+                const bodyText = document.body ? document.body.innerText : '';
+                // 中文错误提示
+                const zhPatterns = [
+                    '视频错误',
+                    '我们已经数次尝试播放您的视频',
+                    '发生了未知错误',
+                ];
+                // 英文错误提示
+                const enPatterns = [
+                    'Video Error',
+                    "We've tried playing your video several times",
+                    'unknown error',
+                    'Something went wrong',
+                    'Error loading video',
+                ];
+                for (const p of zhPatterns) {
+                    if (bodyText.includes(p)) return {error: true, lang: 'zh', match: p};
+                }
+                for (const p of enPatterns) {
+                    if (bodyText.includes(p)) return {error: true, lang: 'en', match: p};
+                }
+                return {error: false};
+            }
+        """)
+        return result
+    except:
+        return {"error": False}
 
 
 async def reload_page(page):
@@ -635,6 +671,8 @@ async def watch(page, target_s, rate):
     stag_count = 0       # currentTime 连续停滞次数
     refresh_count = 0    # 同一章节连续刷新次数
     play_fail = 0        # 连续调用 play() 但视频仍暂停的次数
+    error_retry_count = 0  # 视频错误重试次数（同一章节）
+    MAX_ERROR_RETRIES = 3  # 最多刷新重试 3 次，超过则标记完成跳过
     last_url = page.url
 
     # 提取课程信息
@@ -659,6 +697,7 @@ async def watch(page, target_s, rate):
             refresh_count = 0
             vid_read_fail = 0
             play_fail = 0
+            error_retry_count = 0
 
         try:
             for sel in ['[data-purpose="lecture-title"]', 'h1']:
@@ -679,6 +718,69 @@ async def watch(page, target_s, rate):
                             save_course(course_name, course_url)
                     break
         except: pass
+
+        # ── 视频错误检测 ──
+        # Udemy 偶发 "视频错误/Video Error" 提示，检测到后自动刷新重试
+        err_check = await detect_video_error(page)
+        if err_check.get("error"):
+            error_retry_count += 1
+            match_text = err_check.get("match", "")
+            lang = err_check.get("lang", "")
+            print(f"  ⚠ 检测到视频错误 ({lang}: {match_text}) 第 {error_retry_count}/{MAX_ERROR_RETRIES} 次")
+            log_action("video_error_detected", page.url, f"match={match_text}, lang={lang}, retry={error_retry_count}", False)
+
+            if error_retry_count >= MAX_ERROR_RETRIES:
+                print(f"  ⏭ 视频错误已重试 {MAX_ERROR_RETRIES} 次仍失败，标记完成并跳过")
+                log_action("video_error_give_up", page.url, f"max retries ({MAX_ERROR_RETRIES}) exceeded, skipping", False)
+                error_retry_count = 0
+                if await try_skip(page, last_url, "video-error"):
+                    no_vid = 0; last_ct = -1; stag_count = 0
+                    play_fail = 0; refresh_count = 0
+                    last_progress = time.time()
+                rd(1, 2)
+                continue
+
+            # 刷新页面并等待视频恢复
+            print(f"  🔄 刷新页面重试...")
+            try:
+                await page.reload(wait_until="domcontentloaded")
+                rd(3, 5)
+                # 等待视频元素出现并尝试播放
+                recovered = False
+                for _ in range(20):
+                    vid2, _ = await find_video(page)
+                    if vid2:
+                        # 确认错误提示已消失
+                        err_after = await detect_video_error(page)
+                        if not err_after.get("error"):
+                            if await vid2.evaluate("el => el.paused"):
+                                await vid2.evaluate("el => el.play()")
+                            # 验证视频真的能播放
+                            ct_before = await vid2.evaluate("el => el.currentTime")
+                            await asyncio.sleep(2)
+                            ct_after = await vid2.evaluate("el => el.currentTime")
+                            if ct_after > ct_before + 0.1 or not await vid2.evaluate("el => el.paused"):
+                                recovered = True
+                                print(f"  ✓ 刷新后视频已恢复 (第 {error_retry_count} 次重试成功)")
+                                log_action("video_error_recovered", page.url, f"retry={error_retry_count}", True)
+                                break
+                        else:
+                            print(f"  ⚠ 刷新后仍有视频错误提示，继续等待...")
+                    await asyncio.sleep(1)
+                if recovered:
+                    error_retry_count = 0
+                    last_progress = time.time()
+                    last_ct = -1
+                    stag_count = 0
+                    play_fail = 0
+                else:
+                    print(f"  ⚠ 刷新后视频未恢复，将再次重试")
+                    log_action("video_error_retry_fail", page.url, f"retry={error_retry_count}, not recovered", False)
+            except Exception as e:
+                print(f"  ⚠ 刷新失败: {e}")
+                log_action("video_error_refresh_fail", page.url, f"exception: {e}", False)
+            rd(1, 2)
+            continue
 
         # ── 跨 iframe 查找视频 ──
         vid, vframe = await find_video(page)
@@ -726,6 +828,7 @@ async def watch(page, target_s, rate):
                     last_progress = time.time()
                     last_ct = -1
                     play_fail = 0
+                    error_retry_count = 0
                     rd(3, 6)
                     vid_read_fail = 0
                 else:
@@ -736,6 +839,7 @@ async def watch(page, target_s, rate):
                         last_progress = time.time()
                         stag_count = 0
                         play_fail = 0
+                        error_retry_count = 0
                     else:
                         stag_count += 1
                         if stag_count >= 4:
